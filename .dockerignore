@@ -1,0 +1,18 @@
+# Keep the build context lean. The toolchain tarball is passed explicitly via
+# the GO_TOOLCHAIN_TARBALL build-arg and COPY'd by name, so the wildcard below
+# does not exclude it from being COPY-able (it is still in the context).
+# We only exclude VCS, CI metadata and scratch/diagnostic dirs.
+.git
+.github
+.gitignore
+.gitattributes
+.idea
+.vscode
+gatus-upstream-tmp
+go-src
+go-src-stage1
+go-src-stage1-5
+go-bootstrap0
+toolchain-meta.env
+*.md
+gatus-armv5-*.zip

@@ -1,0 +1,19 @@
+# Build artifacts / toolchain (large, restored from CI cache or built locally)
+go*-armv5.tar.gz
+go-bootstrap0/
+go-src/
+go-src-stage1/
+go-src-stage1-5/
+toolchain-meta.env
+
+# Upstream clone used for version detection
+gatus-upstream-tmp/
+
+# Local build output
+gatus-armv5-*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
