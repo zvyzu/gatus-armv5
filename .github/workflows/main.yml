@@ -1,0 +1,248 @@
+name: Check for Gatus Releases and Build Docker Image
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Runs daily at midnight UTC
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      version:
+        description: 'Specific gatus version to build (e.g. v5.36.0). Leave empty to auto-detect latest.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check_and_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check for new gatus release
+        id: check_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          python - <<EOF
+          import requests
+          import os
+          import sys
+
+          manual_version = os.environ.get('MANUAL_VERSION', '').strip()
+
+          # If a manual version is provided via workflow_dispatch, use it directly.
+          if manual_version:
+              print(f"Manual version specified: {manual_version}")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                  print(f'new_version={manual_version}', file=gh_out)
+              sys.exit(0)
+
+          headers = {
+              "Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN')}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          try:
+              response = requests.get(
+                  'https://api.github.com/repos/TwiN/gatus/releases/latest',
+                  headers=headers,
+                  timeout=10
+              )
+              if response.status_code != 200:
+                  print(f"::warning::GitHub API error: {response.status_code} - {response.text}", file=sys.stderr)
+                  sys.exit(0)  # Exit with warning, do not fail workflow
+
+              data = response.json()
+              latest_version = data.get('tag_name')  # e.g. "v5.36.0"
+              if not latest_version:
+                  print(f'::warning::"tag_name" not found in response. Response: {data}', file=sys.stderr)
+                  sys.exit(0)
+
+              try:
+                  with open('latest_version.txt', 'r') as f:
+                      current_version = f.read().strip()
+              except FileNotFoundError:
+                  current_version = ""
+
+              if latest_version != current_version:
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                      print(f'new_version={latest_version}', file=gh_out)
+              else:
+                  print('No new version found.')
+          except Exception as e:
+              print(f"::warning::Exception occurred: {e}", file=sys.stderr)
+              sys.exit(0)  # Exit with warning, do not fail workflow
+          EOF
+
+      # ------------------------------------------------------------------
+      # Scrape the required Go version from the upstream go.mod (lightweight,
+      # raw file fetch) so we can compute a stable cache key BEFORE building.
+      # ------------------------------------------------------------------
+      - name: Scrape required Go version for cache key
+        if: steps.check_release.outputs.new_version
+        id: go_version_scrape
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<EOF
+          import requests, os, re, sys
+
+          version = "${{ steps.check_release.outputs.new_version }}"
+          headers = {
+              "Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN')}",
+              "Accept": "application/vnd.github+json"
+          }
+          url = f"https://raw.githubusercontent.com/TwiN/gatus/{version}/go.mod"
+          try:
+              r = requests.get(url, headers=headers, timeout=15)
+              if r.status_code != 200:
+                  print(f"::warning::Failed to fetch go.mod: {r.status_code}", file=sys.stderr)
+                  # Fall back to a generic key so the build still proceeds.
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                      print('go_full_version=unknown', file=gh_out)
+                  sys.exit(0)
+              m = re.search(r'^go\s+(\d+\.\d+(?:\.\d+)?)', r.text, re.MULTILINE)
+              if not m:
+                  print("::warning::Could not parse go version", file=sys.stderr)
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                      print('go_full_version=unknown', file=gh_out)
+                  sys.exit(0)
+              v = m.group(1)
+              if re.fullmatch(r'\d+\.\d+', v):
+                  v = v + ".0"
+              print(f"Required Go version: {v}")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                  print(f'go_full_version={v}', file=gh_out)
+          except Exception as e:
+              print(f"::warning::Exception: {e}", file=sys.stderr)
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                  print('go_full_version=unknown', file=gh_out)
+          EOF
+
+      # Enable QEMU for ARM emulation in Buildx
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: steps.check_release.outputs.new_version
+        uses: docker/setup-buildx-action@v4
+
+      # ------------------------------------------------------------------
+      # Cache the Go ARMv5 toolchain tarball keyed by the required Go version.
+      # Rebuilding the toolchain takes a long time (compiling Go 3x), so we
+      # only rebuild when the upstream-required Go version changes.
+      # ------------------------------------------------------------------
+      - name: Cache Go ARMv5 toolchain
+        if: steps.check_release.outputs.new_version
+        id: toolchain_cache
+        uses: actions/cache@v4
+        with:
+          path: go*-armv5.tar.gz
+          key: go-armv5-${{ steps.go_version_scrape.outputs.go_full_version }}
+          restore-keys: |
+            go-armv5-
+
+      - name: Install build tools for Go cross-compilation
+        if: steps.check_release.outputs.new_version
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi curl git tar
+
+      - name: Build Go ARMv5 toolchain (multi-stage bootstrap, auto Go version)
+        if: steps.check_release.outputs.new_version
+        run: |
+          bash build-gatus-armv5.sh "${{ steps.check_release.outputs.new_version }}"
+
+      - name: Read Go toolchain info
+        if: steps.check_release.outputs.new_version
+        id: go_meta
+        run: |
+          source toolchain-meta.env
+          echo "go_toolchain_tarball=$GO_TARBALL" >> $GITHUB_OUTPUT
+          echo "go_full_version=$GO_FULL_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        if: steps.check_release.outputs.new_version
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        if: steps.check_release.outputs.new_version
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.check_release.outputs.new_version
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.check_release.outputs.new_version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/gatus-armv5:${{ steps.check_release.outputs.new_version }}
+            ghcr.io/${{ github.repository_owner }}/gatus-armv5:latest
+          build-args: |
+            GATUS_VERSION=${{ steps.check_release.outputs.new_version }}
+            GO_TOOLCHAIN_TARBALL=${{ steps.go_meta.outputs.go_toolchain_tarball }}
+          platforms: linux/arm/v5
+
+      - name: Update latest_version.txt and push to repo
+        if: steps.check_release.outputs.new_version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ steps.check_release.outputs.new_version }}" > latest_version.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest_version.txt
+          git commit -m "ci: update latest_version.txt to ${{ steps.check_release.outputs.new_version }}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:${GITHUB_REF}
+
+      - name: Create tag for release
+        if: steps.check_release.outputs.new_version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git rev-parse ${{ steps.check_release.outputs.new_version }} >/dev/null 2>&1; then
+            git tag ${{ steps.check_release.outputs.new_version }}
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ${{ steps.check_release.outputs.new_version }}
+          else
+            echo "Tag ${{ steps.check_release.outputs.new_version }} already exists."
+          fi
+
+      - name: Create GitHub Release with source archive
+        if: steps.check_release.outputs.new_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.check_release.outputs.new_version }}"
+          # Always (re)create the release with the source archive attached.
+          git archive --format=zip --output=gatus-armv5-${VERSION}.zip HEAD
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists. Uploading archive."
+            gh release upload "$VERSION" "gatus-armv5-${VERSION}.zip" --clobber
+          else
+            echo "Creating release $VERSION."
+            gh release create "$VERSION" \
+              --title "gatus-armv5 $VERSION" \
+              --notes "Automated release for gatus-armv5 version $VERSION" \
+              "gatus-armv5-${VERSION}.zip"
+          fi
